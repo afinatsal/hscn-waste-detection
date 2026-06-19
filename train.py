@@ -487,10 +487,6 @@ def main():
     )
 
     # Print laporan lengkap
-    metrics_obj = HSCNMetrics()
-    from metrics import HSCNMetrics
-    m = HSCNMetrics()
-    # Recompute dari test_metrics yang sudah dihitung
     logger.info(f"\nTest Loss        : {test_losses.get('total', 0):.4f}")
     logger.info(f"Test Acc L1      : {test_metrics.get('acc_l1', 0):.4f}")
     logger.info(f"Test Acc L2      : {test_metrics.get('acc_l2', 0):.4f}")
