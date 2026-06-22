@@ -204,20 +204,30 @@ def train_epoch(
 
 @torch.no_grad()
 def evaluate(
-    model   : HSCN,
-    loader  : torch.utils.data.DataLoader,
-    loss_fn : HSCNLoss,
-    device  : torch.device,
-    use_amp : bool = True,
+    model        : HSCN,
+    loader       : torch.utils.data.DataLoader,
+    loss_fn      : HSCNLoss,
+    device       : torch.device,
+    use_amp      : bool = True,
+    eval_loss_fn : Optional[HSCNLoss] = None,   # [PERUBAHAN] loss tanpa smoothing untuk val/test
 ) -> Tuple[Dict[str, float], Dict[str, float]]:
     """
     Evaluasi model pada satu loader.
+
+    Args:
+        eval_loss_fn : Jika diberikan, digunakan untuk menghitung val/test loss
+                       (tanpa label_smoothing=0.0) sehingga kurva loss lebih
+                       mudah dibandingkan dengan train loss secara adil.
+                       Jika None, fallback ke loss_fn yang sama dengan training.
 
     Returns:
         loss_dict  : rata-rata loss per komponen
         metric_dict: semua metrik akurasi
     """
     model.eval()
+
+    # [PERUBAHAN] Gunakan eval_loss_fn jika tersedia, fallback ke loss_fn biasa
+    active_loss_fn = eval_loss_fn if eval_loss_fn is not None else loss_fn
 
     metrics    = HSCNMetrics()
     loss_accum = {}
@@ -231,7 +241,7 @@ def evaluate(
 
         with autocast(enabled=use_amp):
             out             = model(imgs)
-            _, loss_dict    = loss_fn(out, l1, l2, l3)
+            _, loss_dict    = active_loss_fn(out, l1, l2, l3)  # [PERUBAHAN]
 
         preds = model.predict(imgs)
         metrics.update(preds, l1, l2, l3)
@@ -334,6 +344,24 @@ def main():
         label_smoothing  = args.label_smoothing,
     ).to(device)
 
+    # [PERUBAHAN] Loss khusus untuk validasi/test — tanpa label smoothing.
+    # Tujuan: agar kurva val loss sebanding (apples-to-apples) dengan train loss
+    # yang dihitung dari distribusi target asli, bukan distribusi yang di-smooth.
+    # Performa model TIDAK berubah; ini hanya mempengaruhi nilai numerik yang dicatat.
+    eval_loss_fn = HSCNLoss(
+        class_weights_l1 = cw_l1,
+        class_weights_l2 = cw_l2,
+        class_weights_l3 = cw_l3,
+        lambda_l1        = args.lambda_l1,
+        lambda_l2        = args.lambda_l2,
+        lambda_l3        = args.lambda_l3,
+        label_smoothing  = 0.0,             # [PERUBAHAN] matikan smoothing untuk eval
+    ).to(device)
+    logger.info(
+        f"Loss training  : label_smoothing={args.label_smoothing} | "
+        f"Loss val/test  : label_smoothing=0.0 (pure CE)"
+    )
+
     # ── Optimizer ─────────────────────────────────────────────────────────────
     optimizer = build_optimizer(model, args)
 
@@ -403,7 +431,9 @@ def main():
 
         # ── Validate ──────────────────────────────────────────────────────────
         valid_losses, valid_metrics = evaluate(
-            model, valid_loader, loss_fn, device, use_amp=args.use_amp
+            model, valid_loader, loss_fn, device,
+            use_amp      = args.use_amp,
+            eval_loss_fn = eval_loss_fn,  # [PERUBAHAN] pakai pure CE untuk val loss
         )
 
         elapsed = time.time() - t0
@@ -483,7 +513,9 @@ def main():
         logger.info(f"Model terbaik dimuat dari: {best_ckpt}")
 
     test_losses, test_metrics = evaluate(
-        model, test_loader, loss_fn, device, use_amp=args.use_amp
+        model, test_loader, loss_fn, device,
+        use_amp      = args.use_amp,
+        eval_loss_fn = eval_loss_fn,  # [PERUBAHAN] konsisten dengan val loss
     )
 
     # Print laporan lengkap
