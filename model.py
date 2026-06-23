@@ -288,6 +288,102 @@ class HSCN(nn.Module):
             "prob_l1": prob_l1,
         }
 
+    @torch.no_grad()
+    def predict_with_probs(
+        self,
+        x: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Prediksi hierarki penuh + joint probability per level sesuai Eq. 5 paper.
+
+        Joint probability (hierarkis):
+            p_l1(c)     = softmax_l1(c)                    — prob L1
+            p_l2(c)     = softmax_l2_local(c) * p_l1(par)  — prob joint L2
+            p_l3(c)     = softmax_l3_local(c) * p_l2(par)  — prob joint L3
+
+        Joint prob digunakan untuk menghitung mAP (sesuai paper).
+
+        Returns:
+            pred_l1       : (B,)  — argmax L1
+            pred_l2       : (B,)  — argmax L2 dalam L2_ALL
+            pred_l3       : (B,)  — argmax L3 dalam L3_ALL
+            prob_l1       : (B, num_l1)
+            prob_l2_joint : (B, num_l2)  — joint prob semua kelas L2
+            prob_l3_joint : (B, num_l3)  — joint prob semua kelas L3
+        """
+        from hierarchy import (
+            L1_CLASSES, L2_SIBLINGS, L3_SIBLINGS,
+            L2_TO_IDX, L3_TO_IDX,
+        )
+
+        out    = self.forward(x)
+        B      = x.size(0)
+        device = x.device
+
+        # ── L1 ────────────────────────────────────────────────────────────────
+        prob_l1 = F.softmax(out["logits_l1"], dim=-1)   # (B, 3)
+        pred_l1 = prob_l1.argmax(dim=-1)                # (B,)
+
+        # ── Joint probability matrix L2 — shape (B, num_l2) ──────────────────
+        num_l2_total = len(L2_TO_IDX)
+        prob_l2_joint = torch.zeros(B, num_l2_total, device=device)
+
+        for l1_idx, l1_name in enumerate(L1_CLASSES):
+            p_l1_this = prob_l1[:, l1_idx]              # (B,) prob L1 = l1_name
+            l2_logits  = out[f"logits_l2_{l1_name}"]    # (B, |siblings|)
+            l2_local   = F.softmax(l2_logits, dim=-1)   # (B, |siblings|)
+            for local_idx, l2_name in enumerate(L2_SIBLINGS[l1_name]):
+                global_idx = L2_TO_IDX[l2_name]
+                # joint: P(L2=c) = P(L2=c | L1=l1) * P(L1=l1)
+                prob_l2_joint[:, global_idx] = l2_local[:, local_idx] * p_l1_this
+
+        pred_l2 = torch.full((B,), -1, dtype=torch.long, device=device)
+        for b in range(B):
+            l1_name   = L1_CLASSES[pred_l1[b].item()]
+            l2_logits = out[f"logits_l2_{l1_name}"][b]
+            l2_local  = l2_logits.argmax().item()
+            l2_name   = L2_SIBLINGS[l1_name][l2_local]
+            pred_l2[b] = L2_TO_IDX[l2_name]
+
+        # ── Joint probability matrix L3 — shape (B, num_l3) ──────────────────
+        num_l3_total  = len(L3_TO_IDX)
+        prob_l3_joint = torch.zeros(B, num_l3_total, device=device)
+
+        for l2_name, l3_children in L3_SIBLINGS.items():
+            l2_global_idx = L2_TO_IDX[l2_name]
+            p_l2_this     = prob_l2_joint[:, l2_global_idx]   # (B,)
+            l3_logits     = out[f"logits_l3_{l2_name}"]       # (B, |children|)
+            l3_local      = F.softmax(l3_logits, dim=-1)      # (B, |children|)
+            for local_idx, l3_name in enumerate(l3_children):
+                global_idx = L3_TO_IDX[l3_name]
+                prob_l3_joint[:, global_idx] = l3_local[:, local_idx] * p_l2_this
+
+        pred_l3 = torch.full((B,), -1, dtype=torch.long, device=device)
+        for b in range(B):
+            l2_idx = pred_l2[b].item()
+            if l2_idx < 0:
+                continue
+            # cari nama l2 dari global idx
+            l2_name = None
+            for name, idx in L2_TO_IDX.items():
+                if idx == l2_idx:
+                    l2_name = name
+                    break
+            if l2_name and l2_name in L3_SIBLINGS:
+                l3_logits = out[f"logits_l3_{l2_name}"][b]
+                l3_local  = l3_logits.argmax().item()
+                l3_name   = L3_SIBLINGS[l2_name][l3_local]
+                pred_l3[b] = L3_TO_IDX[l3_name]
+
+        return {
+            "pred_l1"      : pred_l1,
+            "pred_l2"      : pred_l2,
+            "pred_l3"      : pred_l3,
+            "prob_l1"      : prob_l1,
+            "prob_l2_joint": prob_l2_joint,
+            "prob_l3_joint": prob_l3_joint,
+        }
+
     def get_trainable_params(self, backbone_lr_scale: float = 0.1):
         """
         Kembalikan parameter groups untuk optimizer dengan learning rate

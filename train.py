@@ -243,7 +243,8 @@ def evaluate(
             out             = model(imgs)
             _, loss_dict    = active_loss_fn(out, l1, l2, l3)  # [PERUBAHAN]
 
-        preds = model.predict(imgs)
+        # predict_with_probs() → mAP dapat dihitung (prob_l1/l2/l3 tersedia)
+        preds = model.predict_with_probs(imgs)
         metrics.update(preds, l1, l2, l3)
 
         for k, v in loss_dict.items():
@@ -384,18 +385,20 @@ def main():
     scaler = GradScaler() if (args.use_amp and device.type == "cuda") else None
 
     # ── Resume dari checkpoint ────────────────────────────────────────────────
-    start_epoch  = 0
-    best_acc_l1  = 0.0
-    history      = []
+    start_epoch   = 0
+    best_acc_l1   = 0.0
+    best_mAP_mean = 0.0   # monitor checkpoint berdasarkan mAP_mean
+    history       = []
 
     if args.resume and os.path.isfile(args.resume):
         logger.info(f"Melanjutkan dari checkpoint: {args.resume}")
         ckpt = torch.load(args.resume, map_location=device)
         model.load_state_dict(ckpt["model_state"])
         optimizer.load_state_dict(ckpt["optimizer_state"])
-        start_epoch = ckpt.get("epoch", 0) + 1
-        best_acc_l1 = ckpt.get("best_acc_l1", 0.0)
-        history     = ckpt.get("history", [])
+        start_epoch   = ckpt.get("epoch", 0) + 1
+        best_acc_l1   = ckpt.get("best_acc_l1", 0.0)
+        best_mAP_mean = ckpt.get("best_mAP_mean", 0.0)
+        history       = ckpt.get("history", [])
         if scheduler and "scheduler_state" in ckpt:
             scheduler.load_state_dict(ckpt["scheduler_state"])
         logger.info(f"Dilanjutkan dari epoch {start_epoch}")
@@ -446,10 +449,11 @@ def main():
             f"| LR: {current_lr_head:.2e} "
             f"| Train Loss: {train_losses.get('total', 0):.4f} "
             f"| Val Loss: {valid_losses.get('total', 0):.4f} "
-            f"| Val Acc L1: {valid_metrics.get('acc_l1', 0):.4f} "
-            f"| Val Acc L2: {valid_metrics.get('acc_l2', 0):.4f} "
-            f"| Val Acc L3: {valid_metrics.get('acc_l3', 0):.4f} "
-            f"| Val Acc Mean: {valid_metrics.get('acc_mean', 0):.4f}"
+            f"| Val mAP L1: {valid_metrics.get('mAP_l1', 0):.4f} "
+            f"| Val mAP L2: {valid_metrics.get('mAP_l2', 0):.4f} "
+            f"| Val mAP L3: {valid_metrics.get('mAP_l3', 0):.4f} "
+            f"| Val mAP Mean: {valid_metrics.get('mAP_mean', 0):.4f} "
+            f"| Val Acc L1: {valid_metrics.get('acc_l1', 0):.4f}"
         )
 
         # ── Simpan history ─────────────────────────────────────────────────────
@@ -457,19 +461,26 @@ def main():
             "epoch"         : epoch + 1,
             "train_loss"    : train_losses.get("total", 0),
             "val_loss"      : valid_losses.get("total", 0),
-            "val_acc_l1"    : valid_metrics.get("acc_l1", 0),
-            "val_acc_l2"    : valid_metrics.get("acc_l2", 0),
-            "val_acc_l3"    : valid_metrics.get("acc_l3", 0),
-            "val_acc_mean"  : valid_metrics.get("acc_mean", 0),
-            "lr"            : current_lr_head,
+            # mAP (paper metric)
+            "val_mAP_l1"   : valid_metrics.get("mAP_l1", 0),
+            "val_mAP_l2"   : valid_metrics.get("mAP_l2", 0),
+            "val_mAP_l3"   : valid_metrics.get("mAP_l3", 0),
+            "val_mAP_mean" : valid_metrics.get("mAP_mean", 0),
+            # Accuracy (informatif)
+            "val_acc_l1"   : valid_metrics.get("acc_l1", 0),
+            "val_acc_l2"   : valid_metrics.get("acc_l2", 0),
+            "val_acc_l3"   : valid_metrics.get("acc_l3", 0),
+            "lr"           : current_lr_head,
         }
         history.append(epoch_record)
 
         # ── Simpan checkpoint terbaik ──────────────────────────────────────────
-        val_acc = valid_metrics.get("acc_l1", 0)
-        is_best = val_acc > best_acc_l1
+        # Monitor: mAP_mean (paper metric). Fallback ke acc_l1 jika mAP belum ada.
+        cur_mAP  = valid_metrics.get("mAP_mean", valid_metrics.get("acc_l1", 0))
+        is_best  = cur_mAP > best_mAP_mean
         if is_best:
-            best_acc_l1 = val_acc
+            best_mAP_mean = cur_mAP
+            best_acc_l1   = valid_metrics.get("acc_l1", best_acc_l1)
             best_ckpt_path = os.path.join(args.ckpt_dir, f"{args.run_name}_best.pth")
             torch.save({
                 "epoch"          : epoch,
@@ -477,11 +488,15 @@ def main():
                 "optimizer_state": optimizer.state_dict(),
                 "scheduler_state": scheduler.state_dict() if scheduler else None,
                 "best_acc_l1"    : best_acc_l1,
+                "best_mAP_mean"  : best_mAP_mean,
                 "valid_metrics"  : valid_metrics,
                 "args"           : vars(args),
                 "history"        : history,
             }, best_ckpt_path)
-            logger.info(f"  ✓ Best model disimpan (acc_l1={best_acc_l1:.4f})")
+            logger.info(
+                f"  ✓ Best model disimpan "
+                f"(mAP_mean={best_mAP_mean:.4f}, acc_l1={best_acc_l1:.4f})"
+            )
 
         # ── Simpan checkpoint periodik ─────────────────────────────────────────
         if (epoch + 1) % args.save_every == 0:
@@ -518,14 +533,22 @@ def main():
         eval_loss_fn = eval_loss_fn,  # [PERUBAHAN] konsisten dengan val loss
     )
 
-    # Print laporan lengkap
+    # Print laporan lengkap (termasuk mAP, acc, dan confusion matrix)
+    from metrics import HSCNMetrics as _Metrics
+    # Re-run evaluasi dengan akumulator fresh agar bisa panggil format_report
+    full_metrics = _Metrics()
+    model.eval()
+    for imgs_t, l1_t, l2_t, l3_t in test_loader:
+        imgs_t = imgs_t.to(device)
+        l1_t   = l1_t.to(device)
+        l2_t   = l2_t.to(device)
+        l3_t   = l3_t.to(device)
+        with torch.no_grad():
+            preds_t = model.predict_with_probs(imgs_t)
+        full_metrics.update(preds_t, l1_t, l2_t, l3_t)
+
     logger.info(f"\nTest Loss        : {test_losses.get('total', 0):.4f}")
-    logger.info(f"Test Acc L1      : {test_metrics.get('acc_l1', 0):.4f}")
-    logger.info(f"Test Acc L2      : {test_metrics.get('acc_l2', 0):.4f}")
-    logger.info(f"Test Acc L3      : {test_metrics.get('acc_l3', 0):.4f}")
-    logger.info(f"Test Acc Mean    : {test_metrics.get('acc_mean', 0):.4f}")
-    logger.info(f"Test Hier L1+L2  : {test_metrics.get('acc_hier_l1l2', 0):.4f}")
-    logger.info(f"Test Hier All    : {test_metrics.get('acc_hier_all', 0):.4f}")
+    logger.info("\n" + full_metrics.format_report(test_metrics))
 
     # Simpan hasil ke JSON
     results_path = os.path.join(args.log_dir, f"{args.run_name}_test_results.json")

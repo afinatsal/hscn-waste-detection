@@ -261,11 +261,13 @@ def evaluate_test(
         l3   = l3.to(device)
 
         with torch.no_grad():
-            preds = model.predict(imgs)
+            # predict_with_probs() → mAP + confusion matrix tersedia
+            preds = model.predict_with_probs(imgs)
 
         metrics.update(preds, l1, l2, l3)
 
     results = metrics.compute()
+    # format_report() mencetak mAP, acc, dan confusion matrix sekaligus
     print(metrics.format_report(results))
     return results
 
