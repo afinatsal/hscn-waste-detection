@@ -3,22 +3,29 @@ metrics.py
 ==========
 Evaluasi performa HSCN pada setiap level hirarki.
 
-Metrik utama (sesuai paper Shin et al., 2020):
-    - mAP per level (L1, L2, L3):
-        AP dihitung per kelas (one-vs-rest) dari confidence/probability score,
-        lalu di-rata-rata jadi mAP — sesuai "level-wise mAP at L1/L2/L3"
-        Table 2 & 3 paper.
-        Probability hierarkis mengikuti Eq. 5 paper:
-            p_HSCN(j,L) = p(j,L) x prod_{l=1}^{L-1} p(par(j),l)
-        (softmax lokal dikali semua leluhur — disuplai oleh predict_with_probs)
+Perubahan dari versi sebelumnya:
+    - Akurasi L3 dihitung dengan dua cara:
+        1. acc_l3_specific : akurasi hanya pada sampel yang punya L3 spesifik
+           (ground truth != -1, bukan __none__)
+        2. acc_l3_stop     : akurasi "keputusan berhenti" — apakah model
+           benar memprediksi -1 (berhenti di L2) untuk sampel yang memang
+           tidak punya L3 spesifik
+        3. acc_l3          : akurasi gabungan (semua sampel yang punya L2
+           dengan L3 siblings)
 
-    - Confusion matrix:
-        Ditampilkan hanya di format_report() (akhir evaluasi per model).
-        Baris = true, kolom = predicted (argmax).
+Encoding pred_l3 dari model.predict():
+    -1   → model memilih __none__ (berhenti di L2)
+    >= 0 → model memilih kelas L3 spesifik (index di L3_ALL)
+
+Encoding true_l3 dari dataset:
+    -1              → L2 tidak punya L3 siblings (Food_Waste, Battery, E_Waste)
+    -(l2_idx + 10)  → __none__ sentinel (L2 punya L3 tapi tidak ada sub-tipe)
+    >= 0            → index global L3 di L3_ALL
 """
 
 import numpy as np
 from typing import Dict, List, Optional
+from collections import defaultdict
 
 import torch
 
@@ -26,84 +33,70 @@ from hierarchy import (
     L1_CLASSES, L2_ALL, L3_ALL,
     L2_SIBLINGS, L3_SIBLINGS,
     L2_TO_IDX, L3_TO_IDX,
+    L3_NONE_LABEL,
 )
 
 
-# ─── AP helper ────────────────────────────────────────────────────────────────
+def decode_true_l3(true_l3_val: int, true_l2_val: int) -> Optional[int]:
+    """
+    Decode label L3 dari dataset ke nilai yang bisa dibandingkan dengan pred_l3.
 
-def _ap_from_scores(y_true, y_score):
-    if y_true.sum() == 0:
-        return float("nan")
-    order     = np.argsort(-y_score)
-    y_true    = y_true[order]
-    tp_cum    = np.cumsum(y_true)
-    fp_cum    = np.cumsum(1 - y_true)
-    total_p   = y_true.sum()
-    precision = tp_cum / (tp_cum + fp_cum + 1e-12)
-    recall    = tp_cum / (total_p + 1e-12)
-    precision = np.concatenate([[1.0], precision])
-    recall    = np.concatenate([[0.0], recall])
-    return float(np.sum(np.diff(recall) * precision[1:]))
+    Returns:
+        None  → sampel ini tidak relevan untuk evaluasi L3 (L2 tidak punya L3)
+        -1    → ground truth adalah __none__ (berhenti di L2)
+        >= 0  → index global L3 spesifik
+    """
+    if true_l3_val == -1:
+        # L2 tidak punya L3 siblings → tidak relevan
+        return None
+    elif true_l3_val < -1:
+        # Sentinel -(l2_idx + 10) → ground truth adalah __none__
+        return -1
+    else:
+        # Kelas L3 spesifik
+        return true_l3_val
 
-
-def _map_from_scores(true_labels, score_matrix, num_classes):
-    ap_per_class = []
-    valid_aps    = []
-    for c in range(num_classes):
-        ap = _ap_from_scores((true_labels == c).astype(np.float32), score_matrix[:, c])
-        ap_per_class.append(ap)
-        if not np.isnan(ap):
-            valid_aps.append(ap)
-    return {"mAP": float(np.mean(valid_aps)) if valid_aps else 0.0,
-            "AP_per_class": ap_per_class}
-
-
-# ─── Confusion matrix helper ──────────────────────────────────────────────────
-
-def _confusion_matrix(y_true, y_pred, num_classes):
-    cm = np.zeros((num_classes, num_classes), dtype=np.int64)
-    for t, p in zip(y_true, y_pred):
-        if 0 <= t < num_classes and 0 <= p < num_classes:
-            cm[t, p] += 1
-    return cm
-
-
-def _format_confusion_matrix(cm, class_names):
-    col_w  = max(max(len(c) for c in class_names), 6) + 2
-    header = " " * col_w + "".join(f"{c:>{col_w}}" for c in class_names)
-    lines  = [header]
-    for i, row_name in enumerate(class_names):
-        row = f"{row_name:>{col_w}}" + "".join(
-            f"{cm[i, j]:>{col_w}}" for j in range(len(class_names))
-        )
-        lines.append(row)
-    return "\n".join(lines)
-
-
-# ─── HSCNMetrics ──────────────────────────────────────────────────────────────
 
 class HSCNMetrics:
     """
-    Akumulator metrik HSCN.
+    Akumulator metrik untuk evaluasi HSCN.
 
-    Jika update() menerima output predict_with_probs() (ada kunci prob_l1,
-    prob_l2_joint, prob_l3_joint) → hitung mAP + acc.
-    Jika hanya output predict() lama → hitung acc saja.
+    Usage:
+        metrics = HSCNMetrics()
+        for batch in dataloader:
+            preds = model.predict(imgs)
+            metrics.update(preds, label_l1, label_l2, label_l3)
+        results = metrics.compute()
+        metrics.reset()
     """
 
     def __init__(self):
         self.reset()
 
     def reset(self):
-        self._pred_l1 = []; self._true_l1 = []
-        self._pred_l2 = []; self._true_l2 = []
-        self._pred_l3 = []; self._true_l3 = []
-        self._prob_l1       = []
-        self._prob_l2_joint = []
-        self._prob_l3_joint = []
-        self._has_probs = False
+        self._pred_l1 = []
+        self._true_l1 = []
+        self._pred_l2 = []
+        self._true_l2 = []
+        self._pred_l3 = []
+        self._true_l3 = []   # raw dari dataset (bisa berisi sentinel)
 
-    def update(self, preds, true_l1, true_l2, true_l3):
+    def update(
+        self,
+        preds   : Dict[str, torch.Tensor],
+        true_l1 : torch.Tensor,
+        true_l2 : torch.Tensor,
+        true_l3 : torch.Tensor,
+    ):
+        """
+        Akumulasi prediksi dan ground truth satu batch.
+
+        Args:
+            preds   : output dari model.predict()
+            true_l1 : (B,) label L1
+            true_l2 : (B,) label L2  (-1 = tidak ada)
+            true_l3 : (B,) label L3  (-1 = tidak ada, -(l2+10) = __none__, >= 0 = valid)
+        """
         self._pred_l1.extend(preds["pred_l1"].cpu().numpy().tolist())
         self._true_l1.extend(true_l1.cpu().numpy().tolist())
         self._pred_l2.extend(preds["pred_l2"].cpu().numpy().tolist())
@@ -111,169 +104,183 @@ class HSCNMetrics:
         self._pred_l3.extend(preds["pred_l3"].cpu().numpy().tolist())
         self._true_l3.extend(true_l3.cpu().numpy().tolist())
 
-        if "prob_l1" in preds:
-            self._prob_l1.append(preds["prob_l1"].cpu().numpy())
-            self._has_probs = True
-        if "prob_l2_joint" in preds:
-            self._prob_l2_joint.append(preds["prob_l2_joint"].cpu().numpy())
-        if "prob_l3_joint" in preds:
-            self._prob_l3_joint.append(preds["prob_l3_joint"].cpu().numpy())
+    def compute(self) -> Dict[str, float]:
+        """
+        Hitung semua metrik dari akumulasi data.
 
-    def compute(self):
-        pred_l1 = np.array(self._pred_l1); true_l1 = np.array(self._true_l1)
-        pred_l2 = np.array(self._pred_l2); true_l2 = np.array(self._true_l2)
-        pred_l3 = np.array(self._pred_l3); true_l3 = np.array(self._true_l3)
-        mask_l2v = (true_l2 >= 0)
-        mask_l3v = (true_l3 >= 0)
-        results  = {}
+        Returns:
+            dict berisi semua metrik skalar.
+        """
+        pred_l1 = np.array(self._pred_l1)
+        true_l1 = np.array(self._true_l1)
+        pred_l2 = np.array(self._pred_l2)
+        true_l2 = np.array(self._true_l2)
+        pred_l3 = np.array(self._pred_l3)
+        true_l3_raw = np.array(self._true_l3)
 
-        # ── Accuracy ──────────────────────────────────────────────────────────
+        # Decode true_l3: sentinel → -1 (none), -1 → None (tidak relevan)
+        true_l3_decoded = np.array([
+            decode_true_l3(int(t3), int(t2))
+            for t3, t2 in zip(true_l3_raw, true_l2)
+        ], dtype=object)
+
+        results = {}
+        N = len(pred_l1)
+
+        # ── L1 Accuracy ───────────────────────────────────────────────────────
         results["acc_l1"] = float((pred_l1 == true_l1).mean())
-        for i, name in enumerate(L1_CLASSES):
-            m = (true_l1 == i)
-            if m.sum() > 0:
-                results[f"acc_l1_{name}"] = float((pred_l1[m] == true_l1[m]).mean())
 
+        for i, name in enumerate(L1_CLASSES):
+            mask = (true_l1 == i)
+            if mask.sum() > 0:
+                results[f"acc_l1_{name}"] = float((pred_l1[mask] == true_l1[mask]).mean())
+
+        # ── L2 Accuracy ───────────────────────────────────────────────────────
+        mask_l2v = (true_l2 >= 0)
         if mask_l2v.sum() > 0:
             results["acc_l2"] = float((pred_l2[mask_l2v] == true_l2[mask_l2v]).mean())
             for i, name in enumerate(L2_ALL):
-                m = mask_l2v & (true_l2 == i)
-                if m.sum() > 0:
-                    results[f"acc_l2_{name}"] = float((pred_l2[m] == true_l2[m]).mean())
+                mask_cls = mask_l2v & (true_l2 == i)
+                if mask_cls.sum() > 0:
+                    results[f"acc_l2_{name}"] = float(
+                        (pred_l2[mask_cls] == true_l2[mask_cls]).mean()
+                    )
         else:
             results["acc_l2"] = 0.0
 
-        if mask_l3v.sum() > 0:
-            results["acc_l3"] = float((pred_l3[mask_l3v] == true_l3[mask_l3v]).mean())
-            for i, name in enumerate(L3_ALL):
-                m = mask_l3v & (true_l3 == i)
-                if m.sum() > 0:
-                    results[f"acc_l3_{name}"] = float((pred_l3[m] == true_l3[m]).mean())
-        else:
-            results["acc_l3"] = 0.0
+        # ── L3 Accuracy ───────────────────────────────────────────────────────
+        # Sampel relevan: true_l3_decoded != None
+        # (artinya L2-nya punya L3 siblings, baik yang punya L3 spesifik maupun __none__)
+        relevant_mask = np.array([v is not None for v in true_l3_decoded])
 
-        if mask_l2v.sum() > 0:
-            results["acc_hier_l1l2"] = float((
+        if relevant_mask.sum() > 0:
+            pred_l3_rel   = pred_l3[relevant_mask]
+            true_l3_rel   = np.array([v for v in true_l3_decoded if v is not None], dtype=int)
+
+            # acc_l3: akurasi keseluruhan (termasuk sampel __none__)
+            results["acc_l3"] = float((pred_l3_rel == true_l3_rel).mean())
+
+            # acc_l3_specific: hanya sampel dengan L3 spesifik (ground truth >= 0)
+            specific_mask = (true_l3_rel >= 0)
+            if specific_mask.sum() > 0:
+                results["acc_l3_specific"] = float(
+                    (pred_l3_rel[specific_mask] == true_l3_rel[specific_mask]).mean()
+                )
+                # Per-class L3 accuracy
+                for i, name in enumerate(L3_ALL):
+                    mask_cls = specific_mask & (true_l3_rel == i)
+                    if mask_cls.sum() > 0:
+                        results[f"acc_l3_{name}"] = float(
+                            (pred_l3_rel[mask_cls] == true_l3_rel[mask_cls]).mean()
+                        )
+            else:
+                results["acc_l3_specific"] = 0.0
+
+            # acc_l3_stop: akurasi "keputusan berhenti di L2"
+            # Sampel yang ground truth-nya __none__ (-1 setelah decode)
+            none_mask = (true_l3_rel == -1)
+            if none_mask.sum() > 0:
+                # Model benar jika pred_l3 == -1 (juga memilih berhenti)
+                results["acc_l3_stop"] = float(
+                    (pred_l3_rel[none_mask] == -1).mean()
+                )
+            else:
+                results["acc_l3_stop"] = float("nan")
+
+        else:
+            results["acc_l3"]          = 0.0
+            results["acc_l3_specific"] = 0.0
+            results["acc_l3_stop"]     = float("nan")
+
+        # ── Hierarchical Accuracy ─────────────────────────────────────────────
+        mask_l2v_idx = np.where(mask_l2v)[0]
+        if len(mask_l2v_idx) > 0:
+            correct_l1l2 = (
                 (pred_l1[mask_l2v] == true_l1[mask_l2v]) &
                 (pred_l2[mask_l2v] == true_l2[mask_l2v])
-            ).mean())
-        if mask_l3v.sum() > 0:
-            results["acc_hier_all"] = float((
-                (pred_l1[mask_l3v] == true_l1[mask_l3v]) &
-                (pred_l2[mask_l3v] == true_l2[mask_l3v]) &
-                (pred_l3[mask_l3v] == true_l3[mask_l3v])
-            ).mean())
+            )
+            results["acc_hier_l1l2"] = float(correct_l1l2.mean())
 
-        # ── mAP per level (paper metric) ──────────────────────────────────────
-        if self._has_probs:
-            if self._prob_l1:
-                pm = np.concatenate(self._prob_l1, axis=0)
-                r  = _map_from_scores(true_l1, pm, len(L1_CLASSES))
-                results["mAP_l1"] = r["mAP"]
-                for i, name in enumerate(L1_CLASSES):
-                    ap = r["AP_per_class"][i]
-                    if not np.isnan(ap):
-                        results[f"AP_l1_{name}"] = float(ap)
+        rel_idx = np.where(relevant_mask)[0]
+        if len(rel_idx) > 0:
+            true_l3_rel_arr = np.array(
+                [v for v in true_l3_decoded if v is not None], dtype=int
+            )
+            correct_all = (
+                (pred_l1[rel_idx] == true_l1[rel_idx]) &
+                (pred_l2[rel_idx] == true_l2[rel_idx]) &
+                (pred_l3[rel_idx] == true_l3_rel_arr)
+            )
+            results["acc_hier_all"] = float(correct_all.mean())
 
-            if self._prob_l2_joint and mask_l2v.sum() > 0:
-                pm = np.concatenate(self._prob_l2_joint, axis=0)
-                r  = _map_from_scores(true_l2[mask_l2v], pm[mask_l2v], len(L2_ALL))
-                results["mAP_l2"] = r["mAP"]
-                for i, name in enumerate(L2_ALL):
-                    ap = r["AP_per_class"][i]
-                    if not np.isnan(ap):
-                        results[f"AP_l2_{name}"] = float(ap)
+        # ── Summary ───────────────────────────────────────────────────────────
+        accs_weighted = [results["acc_l1"]]
+        if mask_l2v.sum() > 0:
+            accs_weighted.append(results["acc_l2"])
+        if relevant_mask.sum() > 0:
+            accs_weighted.append(results["acc_l3"])
+        results["acc_mean"] = float(np.mean(accs_weighted))
 
-            if self._prob_l3_joint and mask_l3v.sum() > 0:
-                pm = np.concatenate(self._prob_l3_joint, axis=0)
-                r  = _map_from_scores(true_l3[mask_l3v], pm[mask_l3v], len(L3_ALL))
-                results["mAP_l3"] = r["mAP"]
-                for i, name in enumerate(L3_ALL):
-                    ap = r["AP_per_class"][i]
-                    if not np.isnan(ap):
-                        results[f"AP_l3_{name}"] = float(ap)
+        results["n_total"]         = N
+        results["n_l2_valid"]      = int(mask_l2v.sum())
+        results["n_l3_relevant"]   = int(relevant_mask.sum())
+        results["n_l3_specific"]   = int(sum(
+            1 for v in true_l3_decoded if v is not None and v >= 0
+        ))
+        results["n_l3_none"]       = int(sum(
+            1 for v in true_l3_decoded if v is not None and v == -1
+        ))
 
-            level_maps = [results[k] for k in ("mAP_l1", "mAP_l2", "mAP_l3") if k in results]
-            if level_maps:
-                results["mAP_mean"] = float(np.mean(level_maps))
-
-        results["n_total"]    = int(len(pred_l1))
-        results["n_l2_valid"] = int(mask_l2v.sum())
-        results["n_l3_valid"] = int(mask_l3v.sum())
         return results
 
-    def compute_confusion_matrices(self):
-        pred_l1 = np.array(self._pred_l1); true_l1 = np.array(self._true_l1)
-        pred_l2 = np.array(self._pred_l2); true_l2 = np.array(self._true_l2)
-        pred_l3 = np.array(self._pred_l3); true_l3 = np.array(self._true_l3)
-        cms = {"cm_l1": _confusion_matrix(true_l1, pred_l1, len(L1_CLASSES))}
-        mask_l2v = (true_l2 >= 0)
-        if mask_l2v.sum() > 0:
-            cms["cm_l2"] = _confusion_matrix(true_l2[mask_l2v], pred_l2[mask_l2v], len(L2_ALL))
-        mask_l3v = (true_l3 >= 0)
-        if mask_l3v.sum() > 0:
-            cms["cm_l3"] = _confusion_matrix(true_l3[mask_l3v], pred_l3[mask_l3v], len(L3_ALL))
-        return cms
-
-    def format_report(self, results=None):
-        """Laporan lengkap: mAP, acc, dan confusion matrix."""
+    def format_report(self, results: Optional[Dict] = None) -> str:
         if results is None:
             results = self.compute()
 
         lines = ["=" * 60, "HSCN Evaluation Report", "=" * 60]
-        lines += [
-            f"Samples total   : {results.get('n_total', 0)}",
-            f"Samples w/ L2   : {results.get('n_l2_valid', 0)}",
-            f"Samples w/ L3   : {results.get('n_l3_valid', 0)}", "",
-        ]
 
-        # mAP — metrik utama sesuai paper
-        if "mAP_l1" in results:
-            lines += [
-                "── mAP per Level  [paper metric] ────────────────────────",
-                f"  mAP L1         : {results.get('mAP_l1', 0):.4f}",
-                f"  mAP L2         : {results.get('mAP_l2', 0):.4f}",
-                f"  mAP L3         : {results.get('mAP_l3', 0):.4f}",
-                f"  mAP Mean       : {results.get('mAP_mean', 0):.4f}", "",
-                "── AP per Class (L1) ────────────────────────────────────",
-            ]
-            for name in L1_CLASSES:
-                k = f"AP_l1_{name}"
-                if k in results:
-                    lines.append(f"  {name:<15}: {results[k]:.4f}")
-            lines += ["", "── AP per Class (L2) ────────────────────────────────────"]
-            for name in L2_ALL:
-                k = f"AP_l2_{name}"
-                if k in results:
-                    lines.append(f"  {name:<20}: {results[k]:.4f}")
-            lines += ["", "── AP per Class (L3) ────────────────────────────────────"]
-            for name in L3_ALL:
-                k = f"AP_l3_{name}"
-                if k in results:
-                    lines.append(f"  {name:<25}: {results[k]:.4f}")
-            lines.append("")
+        lines.append(f"Samples total          : {results.get('n_total', 0)}")
+        lines.append(f"Samples w/ L2          : {results.get('n_l2_valid', 0)}")
+        lines.append(f"Samples w/ L3 (rel)    : {results.get('n_l3_relevant', 0)}")
+        lines.append(f"  - L3 spesifik        : {results.get('n_l3_specific', 0)}")
+        lines.append(f"  - L3 none (stop L2)  : {results.get('n_l3_none', 0)}")
+        lines.append("")
 
-        # Accuracy
-        lines += [
-            "── Accuracy per Level ───────────────────────────────────",
-            f"  L1 Accuracy    : {results.get('acc_l1', 0):.4f}",
-            f"  L2 Accuracy    : {results.get('acc_l2', 0):.4f}",
-            f"  L3 Accuracy    : {results.get('acc_l3', 0):.4f}", "",
-            "── Hierarchical Accuracy ────────────────────────────────",
-            f"  L1+L2          : {results.get('acc_hier_l1l2', 0):.4f}",
-            f"  L1+L2+L3       : {results.get('acc_hier_all', 0):.4f}", "",
-        ]
+        lines.append("── Level Accuracy ──────────────────────────────────────")
+        lines.append(f"  L1 Accuracy          : {results.get('acc_l1', 0):.4f}")
+        lines.append(f"  L2 Accuracy          : {results.get('acc_l2', 0):.4f}")
+        lines.append(f"  L3 Accuracy (all)    : {results.get('acc_l3', 0):.4f}")
+        lines.append(f"  L3 Acc (specific)    : {results.get('acc_l3_specific', 0):.4f}")
+        stop_acc = results.get('acc_l3_stop', float('nan'))
+        stop_str = f"{stop_acc:.4f}" if not (isinstance(stop_acc, float) and np.isnan(stop_acc)) else "N/A"
+        lines.append(f"  L3 Acc (stop@L2)     : {stop_str}")
+        lines.append(f"  Mean Accuracy        : {results.get('acc_mean', 0):.4f}")
+        lines.append("")
 
-        # Confusion matrices
-        cms = self.compute_confusion_matrices()
-        lines += ["── Confusion Matrix L1 ──────────────────────────────────",
-                  _format_confusion_matrix(cms["cm_l1"], L1_CLASSES), ""]
-        if "cm_l2" in cms:
-            lines += ["── Confusion Matrix L2 ──────────────────────────────────",
-                      _format_confusion_matrix(cms["cm_l2"], L2_ALL), ""]
-        if "cm_l3" in cms:
-            lines += ["── Confusion Matrix L3 ──────────────────────────────────",
-                      _format_confusion_matrix(cms["cm_l3"], L3_ALL), ""]
+        lines.append("── Hierarchical Accuracy ───────────────────────────────")
+        lines.append(f"  L1+L2                : {results.get('acc_hier_l1l2', 0):.4f}")
+        lines.append(f"  L1+L2+L3             : {results.get('acc_hier_all', 0):.4f}")
+        lines.append("")
+
+        lines.append("── Per-Class L1 ────────────────────────────────────────")
+        for name in L1_CLASSES:
+            k = f"acc_l1_{name}"
+            if k in results:
+                lines.append(f"  {name:<15}: {results[k]:.4f}")
+
+        lines.append("")
+        lines.append("── Per-Class L2 ────────────────────────────────────────")
+        for name in L2_ALL:
+            k = f"acc_l2_{name}"
+            if k in results:
+                lines.append(f"  {name:<20}: {results[k]:.4f}")
+
+        lines.append("")
+        lines.append("── Per-Class L3 (specific only) ────────────────────────")
+        for name in L3_ALL:
+            k = f"acc_l3_{name}"
+            if k in results:
+                lines.append(f"  {name:<25}: {results[k]:.4f}")
 
         lines.append("=" * 60)
         return "\n".join(lines)

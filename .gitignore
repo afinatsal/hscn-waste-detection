@@ -9,3 +9,5 @@ datasets/
 runs/
 weights/
 *.pt
+
+hscn_waste/detect_classify.py
