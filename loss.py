@@ -146,7 +146,17 @@ class HSCNLoss(nn.Module):
         loss_dict["loss_l2"] = loss_l2
 
         # ── 3. Loss L3 (per L2 sibling-set dalam Recyclable) ──────────────────
-        # Hanya dihitung untuk sampel yang memiliki label L3 valid.
+        # [FIX] Sebelumnya loss L3 HANYA dihitung untuk sampel yang punya
+        # label_l3 valid (>=0) — sampel yang memang "berhenti di L2" (label_l3
+        # == -1) tidak pernah ikut training di level L3 sama sekali. Akibatnya
+        # classifier L3 tidak pernah belajar konsep "tidak usah lanjut ke L3",
+        # dan softmax-nya (apalagi yang cuma 1 child seperti Glass/Metal/Paper)
+        # selalu mengeluarkan child itu dengan prob ~1.0.
+        #
+        # Sekarang: SEMUA sampel yang label_l2-nya cocok dengan grup ini diikutkan
+        # (tidak lagi memfilter label_l3 >= 0). Target lokalnya:
+        #   - jika label_l3 menunjuk salah satu child di grup ini → index child itu
+        #   - jika label_l3 == -1 (tidak ada anotasi L3)           → index kelas STOP
 
         total_l3    = torch.tensor(0.0, device=device)
         num_l3_terms = 0
@@ -154,30 +164,36 @@ class HSCNLoss(nn.Module):
         for l2_name, l3_children in L3_SIBLINGS.items():
             l2_global_idx = L2_TO_IDX[l2_name]
             logit_key     = f"logits_l3_{l2_name}"
-            logits        = model_out[logit_key]  # (B, |l3_children|)
+            logits        = model_out[logit_key]  # (B, |l3_children| + 1) — +1 = STOP
 
-            # Mask: sampel dengan L2 == l2_global_idx DAN L3 valid
-            mask_l2  = (label_l2 == l2_global_idx)
-            mask_l3v = (label_l3 >= 0)
-            mask     = mask_l2 & mask_l3v
+            # Mask: semua sampel dengan L2 == l2_global_idx (cukup label L2 valid)
+            mask = (label_l2 == l2_global_idx)
 
             if mask.sum() == 0:
                 continue
 
-            # Konversi label_l3 global → local index
             l3_global_indices = [L3_TO_IDX[c] for c in l3_children]
             global_to_local   = {g: loc for loc, g in enumerate(l3_global_indices)}
+            stop_local_idx    = len(l3_children)   # indeks lokal kelas STOP (terakhir)
 
+            idxs = mask.nonzero(as_tuple=True)[0]
             local_labels = torch.tensor(
-                [global_to_local.get(label_l3[i].item(), 0) for i in mask.nonzero(as_tuple=True)[0]],
+                [
+                    global_to_local.get(label_l3[i].item(), stop_local_idx)
+                    for i in idxs
+                ],
                 device=device,
                 dtype=torch.long,
             )
 
-            # Class weights untuk sibling-set ini
+            # Class weights untuk sibling-set ini (ambil dari cw_l3) + bobot kelas STOP
             cw_l3_sub = None
             if self._cw_l3 is not None:
-                cw_l3_sub = self._cw_l3[l3_global_indices].to(device)
+                cw_real = self._cw_l3[l3_global_indices].to(device)
+                # Bobot kelas STOP belum punya statistik tersendiri di dataset,
+                # jadi dinetralkan dengan rata-rata bobot child di grup ini.
+                stop_w  = cw_real.mean().unsqueeze(0)
+                cw_l3_sub = torch.cat([cw_real, stop_w], dim=0)
 
             loss_l3_sub = self._ce(logits[mask], local_labels, weight=cw_l3_sub)
             loss_dict[f"loss_l3_{l2_name}"] = loss_l3_sub
@@ -204,23 +220,25 @@ if __name__ == "__main__":
     from hierarchy import num_l1, num_l2, num_l3
 
     B = 8
-    # Simulasi output model
+    # Simulasi output model — setiap grup L3 sekarang punya +1 kelas STOP
     model_out = {
         "logits_l1"            : torch.randn(B, num_l1()),
         "logits_l2_Organic"    : torch.randn(B, 1),
         "logits_l2_Recyclable" : torch.randn(B, 5),
         "logits_l2_Hazardous"  : torch.randn(B, 2),
-        "logits_l3_Plastic"    : torch.randn(B, 3),
-        "logits_l3_Metal"      : torch.randn(B, 1),
-        "logits_l3_Paper"      : torch.randn(B, 1),
-        "logits_l3_Cardboard"  : torch.randn(B, 1),
-        "logits_l3_Glass"      : torch.randn(B, 1),
+        "logits_l3_Plastic"    : torch.randn(B, 3 + 1),   # 3 child + STOP
+        "logits_l3_Metal"      : torch.randn(B, 1 + 1),   # 1 child + STOP
+        "logits_l3_Paper"      : torch.randn(B, 1 + 1),
+        "logits_l3_Cardboard"  : torch.randn(B, 1 + 1),
+        "logits_l3_Glass"      : torch.randn(B, 1 + 1),
     }
 
     # Simulasi label (campuran dengan partial annotation)
     label_l1 = torch.tensor([1, 1, 0, 2, 1, 1, 0, 2])  # Recyclable, Organic, Hazardous
     label_l2 = torch.tensor([0, 1, 0, 0, 2, 3, -1, 1])  # sebagian valid
-    label_l3 = torch.tensor([0, -1, -1, -1, -1, -1, -1, -1])  # hanya satu L3 valid
+    # label_l3 == -1 berarti "berhenti di L2" (mis. sample index 4 & 5: L2 valid
+    # tapi tidak ada anotasi L3 → harus dilatih sebagai kelas STOP, bukan dibuang)
+    label_l3 = torch.tensor([0, -1, -1, -1, -1, -1, -1, -1])
 
     # Sesuaikan: L2 untuk Recyclable dimulai index 1 di L2_ALL
     from hierarchy import L2_ALL, L3_ALL

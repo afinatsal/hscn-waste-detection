@@ -142,13 +142,22 @@ class HSCN(nn.Module):
         })
 
         # ── 5. L3 Classifiers (satu per L2 sibling set di Recyclable) ─────────
-        # Plastic   → [Plastic_Bottle, Plastic_Cup, Plastic_Bag_Film]  (3 kelas)
-        # Metal     → [Metal_Can]       (1 kelas)
-        # Paper     → [Paper_Sheet]     (1 kelas)
-        # Cardboard → [Cardboard_Box]   (1 kelas)
-        # Glass     → [Glass_Bottle]    (1 kelas)
+        # Plastic   → [Plastic_Bottle, Plastic_Cup, Plastic_Bag_Film, STOP]  (3+1 kelas)
+        # Metal     → [Metal_Can, STOP]       (1+1 kelas)
+        # Paper     → [Paper_Sheet, STOP]     (1+1 kelas)
+        # Cardboard → [Cardboard_Box, STOP]   (1+1 kelas)
+        # Glass     → [Glass_Bottle, STOP]    (1+1 kelas)
+        #
+        # [FIX] Setiap sibling-set L3 mendapat SATU kelas tambahan "STOP"
+        # (indeks lokal terakhir = len(children)). Kelas ini mewakili
+        # "anotasi berhenti di L2, tidak ada L3". Tanpa kelas ini, softmax
+        # dipaksa selalu memilih salah satu child L3 walaupun sampel memang
+        # tidak punya label L3 (mis. foto kaca tanpa bentuk botol yang jelas).
+        # Ini terutama krusial untuk Metal/Paper/Cardboard/Glass yang aslinya
+        # cuma punya 1 child — tanpa STOP, softmax 1-kelas itu SELALU bernilai
+        # 1.0 sehingga model 100% "wajib" memprediksi L3.
         self.clf_l3 = nn.ModuleDict({
-            l2: SiblingClassifier(feat_dim, len(children), hidden_dim, dropout)
+            l2: SiblingClassifier(feat_dim, len(children) + 1, hidden_dim, dropout)
             for l2, children in L3_SIBLINGS.items()
         })
 
@@ -276,10 +285,14 @@ class HSCN(nn.Module):
 
             # ── L3 (hanya jika L2 memiliki L3 children) ───────────────────────
             if l2_name in L3_SIBLINGS:
-                l3_logits = out[f"logits_l3_{l2_name}"][b_idx]
-                l3_local  = l3_logits.argmax().item()
-                l3_name   = L3_SIBLINGS[l2_name][l3_local]
-                pred_l3[b_idx] = L3_TO_IDX[l3_name]
+                l3_logits  = out[f"logits_l3_{l2_name}"][b_idx]   # (|children|+1,) — +1 = STOP
+                n_children = len(L3_SIBLINGS[l2_name])
+                l3_local   = l3_logits.argmax().item()
+                # [FIX] indeks lokal terakhir (== n_children) adalah kelas STOP.
+                # Jika model memilih STOP, biarkan pred_l3 tetap -1 (berhenti di L2).
+                if l3_local < n_children:
+                    l3_name = L3_SIBLINGS[l2_name][l3_local]
+                    pred_l3[b_idx] = L3_TO_IDX[l3_name]
 
         return {
             "pred_l1": pred_l1,
@@ -306,10 +319,11 @@ class HSCN(nn.Module):
         Returns:
             pred_l1       : (B,)  — argmax L1
             pred_l2       : (B,)  — argmax L2 dalam L2_ALL
-            pred_l3       : (B,)  — argmax L3 dalam L3_ALL
+            pred_l3       : (B,)  — argmax L3 dalam L3_ALL (-1 jika model memilih STOP di L2)
             prob_l1       : (B, num_l1)
             prob_l2_joint : (B, num_l2)  — joint prob semua kelas L2
-            prob_l3_joint : (B, num_l3)  — joint prob semua kelas L3
+            prob_l3_joint : (B, num_l3)  — joint prob semua kelas L3 (tidak termasuk massa STOP)
+            prob_stop_l3  : (B,)  — probabilitas model memilih berhenti di L2 (tidak lanjut ke L3)
         """
         from hierarchy import (
             L1_CLASSES, L2_SIBLINGS, L3_SIBLINGS,
@@ -346,19 +360,28 @@ class HSCN(nn.Module):
             pred_l2[b] = L2_TO_IDX[l2_name]
 
         # ── Joint probability matrix L3 — shape (B, num_l3) ──────────────────
+        # [FIX] Setiap grup L3 kini punya 1 logit ekstra "STOP" di indeks
+        # terakhir. Softmax dihitung atas (children + STOP), tapi hanya
+        # probabilitas milik child NYATA yang dimasukkan ke prob_l3_joint
+        # — probabilitas yang "lari" ke STOP otomatis tidak dihitung sebagai
+        # milik salah satu child (sesuai semantik mAP per kelas L3 nyata).
         num_l3_total  = len(L3_TO_IDX)
         prob_l3_joint = torch.zeros(B, num_l3_total, device=device)
 
         for l2_name, l3_children in L3_SIBLINGS.items():
             l2_global_idx = L2_TO_IDX[l2_name]
-            p_l2_this     = prob_l2_joint[:, l2_global_idx]   # (B,)
-            l3_logits     = out[f"logits_l3_{l2_name}"]       # (B, |children|)
-            l3_local      = F.softmax(l3_logits, dim=-1)      # (B, |children|)
+            p_l2_this     = prob_l2_joint[:, l2_global_idx]    # (B,)
+            l3_logits     = out[f"logits_l3_{l2_name}"]        # (B, |children|+1)
+            l3_full       = F.softmax(l3_logits, dim=-1)       # (B, |children|+1), termasuk prob STOP
+            n_children    = len(l3_children)
+            l3_local      = l3_full[:, :n_children]            # (B, |children|) — exclude STOP
             for local_idx, l3_name in enumerate(l3_children):
                 global_idx = L3_TO_IDX[l3_name]
                 prob_l3_joint[:, global_idx] = l3_local[:, local_idx] * p_l2_this
 
-        pred_l3 = torch.full((B,), -1, dtype=torch.long, device=device)
+        pred_l3      = torch.full((B,), -1, dtype=torch.long, device=device)
+        prob_stop_l3 = torch.zeros(B, device=device)  # prob model memilih "berhenti di L2"
+
         for b in range(B):
             l2_idx = pred_l2[b].item()
             if l2_idx < 0:
@@ -370,10 +393,17 @@ class HSCN(nn.Module):
                     l2_name = name
                     break
             if l2_name and l2_name in L3_SIBLINGS:
-                l3_logits = out[f"logits_l3_{l2_name}"][b]
-                l3_local  = l3_logits.argmax().item()
-                l3_name   = L3_SIBLINGS[l2_name][l3_local]
-                pred_l3[b] = L3_TO_IDX[l3_name]
+                l3_logits  = out[f"logits_l3_{l2_name}"][b]    # (|children|+1,)
+                n_children = len(L3_SIBLINGS[l2_name])
+                full_probs = F.softmax(l3_logits, dim=-1)
+                prob_stop_l3[b] = full_probs[n_children]        # prob kelas STOP
+
+                l3_local = l3_logits.argmax().item()
+                # [FIX] jika argmax jatuh ke indeks STOP, jangan paksa pilih
+                # salah satu child — biarkan pred_l3 tetap -1 (berhenti di L2).
+                if l3_local < n_children:
+                    l3_name = L3_SIBLINGS[l2_name][l3_local]
+                    pred_l3[b] = L3_TO_IDX[l3_name]
 
         return {
             "pred_l1"      : pred_l1,
@@ -382,6 +412,7 @@ class HSCN(nn.Module):
             "prob_l1"      : prob_l1,
             "prob_l2_joint": prob_l2_joint,
             "prob_l3_joint": prob_l3_joint,
+            "prob_stop_l3" : prob_stop_l3,
         }
 
     def get_trainable_params(self, backbone_lr_scale: float = 0.1):

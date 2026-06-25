@@ -142,12 +142,19 @@ def predict_single(
     if best_l2_name and best_l2_name in L3_SIBLINGS:
         l3_logits = out.get(f"logits_l3_{best_l2_name}")
         if l3_logits is not None:
-            l3_probs = F.softmax(l3_logits, dim=-1)[0]
+            l3_probs   = F.softmax(l3_logits, dim=-1)[0]   # (|children| + 1) — +1 = STOP
+            n_children = len(L3_SIBLINGS[best_l2_name])
             for i, cls in enumerate(L3_SIBLINGS[best_l2_name]):
                 l3_preds.append({
                     "class": cls,
                     "prob" : float(l3_probs[i].item())
                 })
+            # [FIX] tampilkan juga probabilitas "berhenti di L2" agar terlihat
+            # kapan model memutuskan tidak melanjutkan ke L3.
+            l3_preds.append({
+                "class": "STOP_AT_L2",
+                "prob" : float(l3_probs[n_children].item())
+            })
             l3_preds.sort(key=lambda x: x["prob"], reverse=True)
 
     return {

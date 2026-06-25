@@ -152,6 +152,24 @@ class HSCNMetrics:
         else:
             results["acc_l3"] = 0.0
 
+        # ── [BARU] Stop-decision accuracy (mekanisme STOP di L3) ────────────────
+        # Mengukur apakah model bisa membedakan "harus lanjut ke L3" vs
+        # "harus berhenti di L2", terbatas pada sampel yang L2-nya termasuk
+        # grup yang MEMILIKI children L3 (Plastic/Metal/Paper/Cardboard/Glass).
+        # Ini metrik tambahan — tidak menggantikan acc_l3/mAP_l3 di atas.
+        l3_capable_idx = np.array([L2_TO_IDX[l2] for l2 in L3_SIBLINGS.keys()])
+        mask_l3_capable = mask_l2v & np.isin(true_l2, l3_capable_idx)
+        if mask_l3_capable.sum() > 0:
+            true_stop = (true_l3[mask_l3_capable] < 0)
+            pred_stop = (pred_l3[mask_l3_capable] < 0)
+            results["acc_l3_stop_decision"] = float((true_stop == pred_stop).mean())
+            if true_stop.sum() > 0:
+                # Dari sampel yang seharusnya berhenti di L2, berapa % terdeteksi benar
+                results["recall_l3_stop"] = float(pred_stop[true_stop].mean())
+            if (~true_stop).sum() > 0:
+                # Dari sampel yang seharusnya lanjut ke L3, berapa % yang benar terdeteksi "lanjut"
+                results["recall_l3_continue"] = float((~pred_stop[~true_stop]).mean())
+
         if mask_l2v.sum() > 0:
             results["acc_hier_l1l2"] = float((
                 (pred_l1[mask_l2v] == true_l1[mask_l2v]) &
@@ -263,6 +281,16 @@ class HSCNMetrics:
             f"  L1+L2          : {results.get('acc_hier_l1l2', 0):.4f}",
             f"  L1+L2+L3       : {results.get('acc_hier_all', 0):.4f}", "",
         ]
+
+        # [BARU] Stop-decision (mekanisme STOP di L3)
+        if "acc_l3_stop_decision" in results:
+            lines += [
+                "── L3 Stop-Decision  [BARU — kapan model berhenti di L2] ─",
+                f"  Stop-decision acc : {results.get('acc_l3_stop_decision', 0):.4f}",
+                f"  Recall (stop)     : {results.get('recall_l3_stop', float('nan')):.4f}",
+                f"  Recall (lanjut)   : {results.get('recall_l3_continue', float('nan')):.4f}",
+                "",
+            ]
 
         # Confusion matrices
         cms = self.compute_confusion_matrices()

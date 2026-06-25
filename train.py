@@ -453,7 +453,8 @@ def main():
             f"| Val mAP L2: {valid_metrics.get('mAP_l2', 0):.4f} "
             f"| Val mAP L3: {valid_metrics.get('mAP_l3', 0):.4f} "
             f"| Val mAP Mean: {valid_metrics.get('mAP_mean', 0):.4f} "
-            f"| Val Acc L1: {valid_metrics.get('acc_l1', 0):.4f}"
+            f"| Val Acc L1: {valid_metrics.get('acc_l1', 0):.4f} "
+            f"| Val Stop-Acc L3: {valid_metrics.get('acc_l3_stop_decision', 0):.4f}"
         )
 
         # ── Simpan history ─────────────────────────────────────────────────────
@@ -470,6 +471,8 @@ def main():
             "val_acc_l1"   : valid_metrics.get("acc_l1", 0),
             "val_acc_l2"   : valid_metrics.get("acc_l2", 0),
             "val_acc_l3"   : valid_metrics.get("acc_l3", 0),
+            # [BARU] keputusan stop di L3 — mekanisme STOP
+            "val_acc_l3_stop_decision": valid_metrics.get("acc_l3_stop_decision", 0),
             "lr"           : current_lr_head,
         }
         history.append(epoch_record)
