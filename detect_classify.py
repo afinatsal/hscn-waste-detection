@@ -23,7 +23,7 @@ from ultralytics import YOLO
 # ─── Path ────────────────────────────────────────────────────────────────────
 IMAGE_PATH      = "/Users/afinatsal/Desktop/skripsi/testImage/realwaste_glass_000017.jpg"
 YOLO_WEIGHTS    = "/Users/afinatsal/Desktop/skripsi/waste_detection_results_yolol/weights/best.pt"
-HSCN_CHECKPOINT = "/Users/afinatsal/Desktop/skripsi/waste_hscn_results_efficientnet_b3/weights/hscn_waste_efficientnet_b3_best.pth"
+HSCN_CHECKPOINT = "waste_hscn_results_efficientnet_b3/weights/hscn_waste_efficientnet_b3_best.pth"
 OUTPUT_PATH     = "hasil_deteksi.jpg"
 # ─────────────────────────────────────────────────────────────────────────────
 

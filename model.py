@@ -3,21 +3,30 @@ model.py
 ========
 Hierarchical Sibling Classification Network (HSCN) untuk klasifikasi sampah.
 
-Perubahan dari versi sebelumnya:
-    - L3 classifiers sekarang memiliki +1 kelas untuk "__none__" (index 0).
-    - predict() dan predict_with_probs() TIDAK menetapkan pred_l3 jika
-      prediksi L3 adalah "__none__" (pred_l3[b] = -1).
-    - Ini membuat model bisa "memilih berhenti di L2" saat tidak yakin ada L3.
+Mengimplementasikan arsitektur HSCN sesuai paper:
+    "Hierarchical Multi-Label Object Detection Framework for Remote Sensing Images"
+    Shin et al., Remote Sensing 2020.
 
-Struktur Classifier per level (UPDATED):
-    L1 : 1 SoftMax classifier   → 3 kelas
-    L2 : 3 SoftMax classifiers  → sesuai jumlah sibling per L1
-    L3 : 5 SoftMax classifiers  → sesuai jumlah sibling per L2 + 1 (__none__)
-         Plastic     → 4 kelas  (__none__, Plastic_Bottle, Plastic_Cup, Plastic_Bag_Film)
-         Metal       → 2 kelas  (__none__, Metal_Can)
-         Paper       → 2 kelas  (__none__, Paper_Sheet)
-         Cardboard   → 2 kelas  (__none__, Cardboard_Box)
-         Glass       → 2 kelas  (__none__, Glass_Bottle)
+Prinsip utama HSCN:
+    1. Satu backbone bersama (shared feature extractor).
+    2. Classifier TERPISAH untuk SETIAP sibling-set di setiap level.
+       → Menghindari kompetisi SoftMax lintas kelas yang tidak se-level.
+    3. Setiap classifier hanya dilatih dengan sampel yang memiliki anotasi
+       pada level tersebut (partial annotation handling).
+    4. Prediksi final = argmax dari output classifier yang relevan per level.
+
+Struktur Classifier per level:
+    L1 : 1 SoftMax classifier   → 3 kelas  (Organic, Recyclable, Hazardous)
+    L2 : 3 SoftMax classifiers  → masing-masing untuk sibling set tiap L1
+         Organic     → 1 kelas  (Food_Waste)
+         Recyclable  → 5 kelas  (Plastic, Metal, Paper, Cardboard, Glass)
+         Hazardous   → 2 kelas  (Battery, E_Waste)
+    L3 : 5 SoftMax classifiers  → masing-masing untuk sibling set tiap L2-Recyclable
+         Plastic     → 3 kelas  (Plastic_Bottle, Plastic_Cup, Plastic_Bag_Film)
+         Metal       → 1 kelas  (Metal_Can)
+         Paper       → 1 kelas  (Paper_Sheet)
+         Cardboard   → 1 kelas  (Cardboard_Box)
+         Glass       → 1 kelas  (Glass_Bottle)
 """
 
 import torch
@@ -29,9 +38,7 @@ from typing import Dict, List, Optional, Tuple
 from hierarchy import (
     L1_CLASSES, L2_SIBLINGS, L3_SIBLINGS,
     L2_TO_IDX, L3_TO_IDX,
-    L3_NONE_LABEL,
     num_l1, num_l2, num_l3,
-    num_l3_with_none,
 )
 
 
@@ -40,9 +47,10 @@ from hierarchy import (
 class SiblingClassifier(nn.Module):
     """
     Classifier sederhana untuk satu sibling set.
+    Sesuai paper: "fully dense" (fully connected layers).
 
     Architecture:
-        Dropout → FC(feat_dim → hidden) → BN → ReLU → Dropout → FC(hidden → num_classes)
+        Dropout → FC(feat_dim → hidden) → ReLU → Dropout → FC(hidden → num_classes)
     """
 
     def __init__(self, feat_dim: int, num_classes: int, hidden_dim: int = 512,
@@ -58,6 +66,7 @@ class SiblingClassifier(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, feat_dim) → logits: (B, num_classes)"""
         return self.net(x)
 
 
@@ -68,29 +77,30 @@ class HSCN(nn.Module):
     Hierarchical Sibling Classification Network (HSCN).
 
     Args:
-        backbone_name : nama backbone torchvision
+        backbone_name : nama backbone torchvision ('resnet50', 'resnet101',
+                        'efficientnet_b3', 'convnext_small', dsb.)
         pretrained    : gunakan bobot ImageNet pre-trained
         hidden_dim    : ukuran hidden layer di setiap SiblingClassifier
         dropout       : dropout rate
-        freeze_bn     : bekukan BatchNorm backbone
+        freeze_bn     : bekukan BatchNorm backbone (berguna untuk dataset kecil)
     """
 
     SUPPORTED_BACKBONES = {
-        "resnet50"          : (models.resnet50,         models.ResNet50_Weights.IMAGENET1K_V2,       2048),
-        "resnet101"         : (models.resnet101,        models.ResNet101_Weights.IMAGENET1K_V2,      2048),
-        "resnet18"          : (models.resnet18,         models.ResNet18_Weights.IMAGENET1K_V1,       512),
-        "efficientnet_b3"   : (models.efficientnet_b3,  models.EfficientNet_B3_Weights.IMAGENET1K_V1, 1536),
-        "convnext_small"    : (models.convnext_small,   models.ConvNeXt_Small_Weights.IMAGENET1K_V1,  768),
+        "resnet50"        : (models.resnet50,         models.ResNet50_Weights.IMAGENET1K_V2,   2048),
+        "resnet101"       : (models.resnet101,        models.ResNet101_Weights.IMAGENET1K_V2,  2048),
+        "resnet18"        : (models.resnet18,         models.ResNet18_Weights.IMAGENET1K_V1,   512),
+        "efficientnet_b3" : (models.efficientnet_b3,  models.EfficientNet_B3_Weights.IMAGENET1K_V1, 1536),
+        "convnext_small"  : (models.convnext_small,   models.ConvNeXt_Small_Weights.IMAGENET1K_V1, 768),
         "mobilenet_v3_large": (models.mobilenet_v3_large, models.MobileNet_V3_Large_Weights.IMAGENET1K_V2, 960),
     }
 
     def __init__(
         self,
-        backbone_name : str   = "resnet50",
-        pretrained    : bool  = True,
-        hidden_dim    : int   = 512,
+        backbone_name : str  = "resnet50",
+        pretrained    : bool = True,
+        hidden_dim    : int  = 512,
         dropout       : float = 0.5,
-        freeze_bn     : bool  = False,
+        freeze_bn     : bool = False,
     ):
         super().__init__()
 
@@ -104,50 +114,68 @@ class HSCN(nn.Module):
         self.feat_dim      = feat_dim
         self.backbone_name = backbone_name
 
-        # ── 1. Backbone ───────────────────────────────────────────────────────
-        backbone = model_fn(weights=weights if pretrained else None)
+        # ── 1. Build backbone (hapus head classifier bawaan) ──────────────────
+        if pretrained:
+            backbone = model_fn(weights=weights)
+        else:
+            backbone = model_fn(weights=None)
+
         self.backbone = self._strip_classifier(backbone, backbone_name)
 
         if freeze_bn:
             self._freeze_batchnorm(self.backbone)
 
-        # ── 2. Global Average Pooling ─────────────────────────────────────────
+        # ── 2. Global Average Pooling + Flatten ───────────────────────────────
         self.gap = nn.AdaptiveAvgPool2d(1)
 
-        # ── 3. L1 Classifier ──────────────────────────────────────────────────
+        # ── 3. L1 Classifier (satu sibling set: root) ─────────────────────────
+        # Sibling set: {Organic, Recyclable, Hazardous}
         self.clf_l1 = SiblingClassifier(feat_dim, num_l1(), hidden_dim, dropout)
 
-        # ── 4. L2 Classifiers ─────────────────────────────────────────────────
+        # ── 4. L2 Classifiers (satu per L1 sibling set) ───────────────────────
+        # Organic → [Food_Waste]                    (1 kelas)
+        # Recyclable → [Plastic, Metal, Paper, Cardboard, Glass]  (5 kelas)
+        # Hazardous → [Battery, E_Waste]            (2 kelas)
         self.clf_l2 = nn.ModuleDict({
             l1: SiblingClassifier(feat_dim, len(children), hidden_dim, dropout)
             for l1, children in L2_SIBLINGS.items()
         })
 
-        # ── 5. L3 Classifiers (TERMASUK kelas __none__ di index 0) ────────────
-        # num_l3_with_none(l2) = len(L3_SIBLINGS[l2]) termasuk __none__
+        # ── 5. L3 Classifiers (satu per L2 sibling set di Recyclable) ─────────
+        # Plastic   → [Plastic_Bottle, Plastic_Cup, Plastic_Bag_Film]  (3 kelas)
+        # Metal     → [Metal_Can]       (1 kelas)
+        # Paper     → [Paper_Sheet]     (1 kelas)
+        # Cardboard → [Cardboard_Box]   (1 kelas)
+        # Glass     → [Glass_Bottle]    (1 kelas)
         self.clf_l3 = nn.ModuleDict({
-            l2: SiblingClassifier(feat_dim, num_l3_with_none(l2), hidden_dim, dropout)
-            for l2 in L3_SIBLINGS.keys()
+            l2: SiblingClassifier(feat_dim, len(children), hidden_dim, dropout)
+            for l2, children in L3_SIBLINGS.items()
         })
 
-    # ── Backbone helpers ──────────────────────────────────────────────────────
+    # ── Backbone helper methods ────────────────────────────────────────────────
 
     def _strip_classifier(self, model: nn.Module, name: str) -> nn.Module:
+        """Hapus head classifier dari backbone, sisakan feature extractor saja."""
         if name.startswith("resnet"):
+            # ResNet: hapus avgpool + fc
             return nn.Sequential(*list(model.children())[:-2])
         elif name.startswith("efficientnet"):
+            # EfficientNet: hapus classifier
             model.classifier = nn.Identity()
-            return model.features
+            return model.features  # kembalikan hanya bagian features
         elif name.startswith("convnext"):
+            # ConvNeXt: hapus head
             model.classifier = nn.Identity()
             return model.features
         elif name.startswith("mobilenet"):
+            # MobileNetV3: hapus classifier
             model.classifier = nn.Identity()
             return model.features
         else:
             raise ValueError(f"Tidak tahu cara strip backbone: {name}")
 
     def _freeze_batchnorm(self, module: nn.Module):
+        """Bekukan semua BatchNorm layers (set ke eval mode permanen)."""
         for m in module.modules():
             if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
                 m.eval()
@@ -157,82 +185,101 @@ class HSCN(nn.Module):
     # ── Forward ───────────────────────────────────────────────────────────────
 
     def extract_features(self, x: torch.Tensor) -> torch.Tensor:
-        feat_map = self.backbone(x)
-        feat     = self.gap(feat_map)
-        feat     = feat.flatten(1)
+        """
+        Ekstrak feature vector bersama dari backbone.
+
+        Returns:
+            feat: (B, feat_dim)
+        """
+        feat_map = self.backbone(x)          # (B, C, H', W')
+        feat     = self.gap(feat_map)        # (B, C, 1, 1)
+        feat     = feat.flatten(1)           # (B, C)
         return feat
 
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
         """
         Forward pass penuh.
 
+        Args:
+            x : (B, 3, H, W) — batch gambar
+
         Returns:
             dict dengan kunci:
-                'logits_l1'         : (B, 3)
-                'logits_l2_<L1>'    : (B, |L2_siblings|)
-                'logits_l3_<L2>'    : (B, |L3_siblings_incl_none|)
+                'logits_l1'         : (B, 3)          — logits L1
+                'logits_l2_<L1>'    : (B, |siblings|) — logits L2 per L1 parent
+                'logits_l3_<L2>'    : (B, |siblings|) — logits L3 per L2 parent
         """
-        feat = self.extract_features(x)
-        out  = {}
+        feat = self.extract_features(x)   # (B, feat_dim)
 
+        out = {}
+
+        # L1
         out["logits_l1"] = self.clf_l1(feat)
 
+        # L2 — satu classifier per L1 sibling-set
         for l1_name, clf in self.clf_l2.items():
             out[f"logits_l2_{l1_name}"] = clf(feat)
 
+        # L3 — satu classifier per L2 sibling-set (Recyclable subtypes)
         for l2_name, clf in self.clf_l3.items():
             out[f"logits_l3_{l2_name}"] = clf(feat)
 
         return out
 
     @torch.no_grad()
-    def predict(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def predict(
+        self,
+        x: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
         """
-        Prediksi hierarki penuh.
+        Prediksi hierarki penuh menggunakan conditional probability.
 
-        Logika L3:
-            - Jika argmax L3 == 0 (__none__) → pred_l3[b] = -1
-              (artinya objek ini tidak memiliki sub-tipe L3)
-            - Jika argmax L3 > 0 → pred_l3[b] = global index L3 di L3_ALL
+        Strategi (mengikuti YOLO9000 / paper HSCN):
+            P(L2_i | L1_j) × P(L1_j)  → argmax per sibling-set L2
+            P(L3_k | L2_i) × P(L2_i | L1_j) × P(L1_j) → argmax per sibling-set L3
 
         Returns:
-            pred_l1 : (B,)  — index prediksi L1
-            pred_l2 : (B,)  — index prediksi L2 dalam L2_ALL
-            pred_l3 : (B,)  — index prediksi L3 dalam L3_ALL, -1 jika __none__
-            prob_l1 : (B, 3)
+            {
+              'pred_l1'     : (B,) — index prediksi L1
+              'pred_l2'     : (B,) — index prediksi L2 dalam L2_ALL (-1 jika tidak relevan)
+              'pred_l3'     : (B,) — index prediksi L3 dalam L3_ALL (-1 jika tidak ada L3)
+              'prob_l1'     : (B, 3)
+            }
         """
-        out    = self.forward(x)
-        B      = x.size(0)
-        device = x.device
+        from hierarchy import (
+            L1_CLASSES, L2_SIBLINGS, L3_SIBLINGS,
+            L2_TO_IDX, L3_TO_IDX,
+        )
 
-        prob_l1 = F.softmax(out["logits_l1"], dim=-1)
-        pred_l1 = prob_l1.argmax(dim=-1)
+        out  = self.forward(x)
+        B    = x.size(0)
 
-        pred_l2 = torch.full((B,), -1, dtype=torch.long, device=device)
-        pred_l3 = torch.full((B,), -1, dtype=torch.long, device=device)
+        prob_l1  = F.softmax(out["logits_l1"], dim=-1)  # (B, 3)
+        pred_l1  = prob_l1.argmax(dim=-1)               # (B,)
 
-        for b in range(B):
-            l1_idx  = pred_l1[b].item()
+        # L2: pilih argmax dari classifier L2 yang relevan per sampel
+        pred_l2  = torch.full((B,), -1, dtype=torch.long, device=x.device)
+        pred_l3  = torch.full((B,), -1, dtype=torch.long, device=x.device)
+
+        for b_idx in range(B):
+            l1_idx  = pred_l1[b_idx].item()
             l1_name = L1_CLASSES[l1_idx]
 
             # ── L2 ────────────────────────────────────────────────────────────
-            l2_logits = out[f"logits_l2_{l1_name}"][b]
+            l2_logits = out[f"logits_l2_{l1_name}"][b_idx]  # (|L2_siblings|,)
             l2_local  = l2_logits.argmax().item()
             l2_name   = L2_SIBLINGS[l1_name][l2_local]
-            pred_l2[b] = L2_TO_IDX[l2_name]
+            pred_l2[b_idx] = L2_TO_IDX[l2_name]
 
-            # ── L3 ────────────────────────────────────────────────────────────
+            # ── L3 (hanya jika L2 memiliki L3 children) ───────────────────────
             if l2_name in L3_SIBLINGS:
-                l3_logits = out[f"logits_l3_{l2_name}"][b]
+                l3_logits = out[f"logits_l3_{l2_name}"][b_idx]
                 l3_local  = l3_logits.argmax().item()
-
-                if l3_local == 0:
-                    # __none__: model memilih berhenti di L2
-                    pred_l3[b] = -1
-                else:
-                    # Kelas L3 nyata: konversi local → global
-                    l3_name    = L3_SIBLINGS[l2_name][l3_local]
-                    pred_l3[b] = L3_TO_IDX[l3_name]
+                l3_name   = L3_SIBLINGS[l2_name][l3_local]
+                pred_l3[b_idx] = L3_TO_IDX[l3_name]
 
         return {
             "pred_l1": pred_l1,
@@ -242,44 +289,53 @@ class HSCN(nn.Module):
         }
 
     @torch.no_grad()
-    def predict_with_probs(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def predict_with_probs(
+        self,
+        x: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
         """
-        Prediksi hierarki penuh + joint probability per level.
+        Prediksi hierarki penuh + joint probability per level sesuai Eq. 5 paper.
 
-        Joint probability:
-            p_l1(c)  = softmax_l1(c)
-            p_l2(c)  = softmax_l2_local(c) * p_l1(parent)
-            p_l3(c)  = softmax_l3_local(c) * p_l2(parent)
-                       → __none__ tidak dimasukkan ke prob_l3_joint
-                       → probability L3 nyata sudah memperhitungkan prob __none__
+        Joint probability (hierarkis):
+            p_l1(c)     = softmax_l1(c)                    — prob L1
+            p_l2(c)     = softmax_l2_local(c) * p_l1(par)  — prob joint L2
+            p_l3(c)     = softmax_l3_local(c) * p_l2(par)  — prob joint L3
+
+        Joint prob digunakan untuk menghitung mAP (sesuai paper).
 
         Returns:
-            pred_l1       : (B,)
-            pred_l2       : (B,)
-            pred_l3       : (B,)  — -1 jika __none__ diprediksi
+            pred_l1       : (B,)  — argmax L1
+            pred_l2       : (B,)  — argmax L2 dalam L2_ALL
+            pred_l3       : (B,)  — argmax L3 dalam L3_ALL
             prob_l1       : (B, num_l1)
-            prob_l2_joint : (B, num_l2)
-            prob_l3_joint : (B, num_l3)  — hanya kelas nyata, excl. __none__
+            prob_l2_joint : (B, num_l2)  — joint prob semua kelas L2
+            prob_l3_joint : (B, num_l3)  — joint prob semua kelas L3
         """
+        from hierarchy import (
+            L1_CLASSES, L2_SIBLINGS, L3_SIBLINGS,
+            L2_TO_IDX, L3_TO_IDX,
+        )
+
         out    = self.forward(x)
         B      = x.size(0)
         device = x.device
 
         # ── L1 ────────────────────────────────────────────────────────────────
-        prob_l1 = F.softmax(out["logits_l1"], dim=-1)
-        pred_l1 = prob_l1.argmax(dim=-1)
+        prob_l1 = F.softmax(out["logits_l1"], dim=-1)   # (B, 3)
+        pred_l1 = prob_l1.argmax(dim=-1)                # (B,)
 
-        # ── Joint probability L2 ──────────────────────────────────────────────
-        num_l2_total  = len(L2_TO_IDX)
+        # ── Joint probability matrix L2 — shape (B, num_l2) ──────────────────
+        num_l2_total = len(L2_TO_IDX)
         prob_l2_joint = torch.zeros(B, num_l2_total, device=device)
 
         for l1_idx, l1_name in enumerate(L1_CLASSES):
-            p_l1_this = prob_l1[:, l1_idx]
-            l2_logits = out[f"logits_l2_{l1_name}"]
-            l2_local  = F.softmax(l2_logits, dim=-1)
-            for local_i, l2_name in enumerate(L2_SIBLINGS[l1_name]):
-                g = L2_TO_IDX[l2_name]
-                prob_l2_joint[:, g] = l2_local[:, local_i] * p_l1_this
+            p_l1_this = prob_l1[:, l1_idx]              # (B,) prob L1 = l1_name
+            l2_logits  = out[f"logits_l2_{l1_name}"]    # (B, |siblings|)
+            l2_local   = F.softmax(l2_logits, dim=-1)   # (B, |siblings|)
+            for local_idx, l2_name in enumerate(L2_SIBLINGS[l1_name]):
+                global_idx = L2_TO_IDX[l2_name]
+                # joint: P(L2=c) = P(L2=c | L1=l1) * P(L1=l1)
+                prob_l2_joint[:, global_idx] = l2_local[:, local_idx] * p_l1_this
 
         pred_l2 = torch.full((B,), -1, dtype=torch.long, device=device)
         for b in range(B):
@@ -289,40 +345,35 @@ class HSCN(nn.Module):
             l2_name   = L2_SIBLINGS[l1_name][l2_local]
             pred_l2[b] = L2_TO_IDX[l2_name]
 
-        # ── Joint probability L3 ──────────────────────────────────────────────
-        # Hanya kelas L3 nyata (bukan __none__) yang masuk ke prob_l3_joint.
-        # Karena index 0 = __none__, kelas nyata dimulai dari index 1 (local).
+        # ── Joint probability matrix L3 — shape (B, num_l3) ──────────────────
         num_l3_total  = len(L3_TO_IDX)
         prob_l3_joint = torch.zeros(B, num_l3_total, device=device)
 
         for l2_name, l3_children in L3_SIBLINGS.items():
             l2_global_idx = L2_TO_IDX[l2_name]
-            p_l2_this     = prob_l2_joint[:, l2_global_idx]
-            l3_logits     = out[f"logits_l3_{l2_name}"]
-            l3_local_probs = F.softmax(l3_logits, dim=-1)  # (B, n_incl_none)
-
-            # Skip index 0 (__none__), mulai dari 1
-            for local_i, cls_name in enumerate(l3_children):
-                if cls_name == L3_NONE_LABEL:
-                    continue
-                global_i = L3_TO_IDX[cls_name]
-                prob_l3_joint[:, global_i] = l3_local_probs[:, local_i] * p_l2_this
+            p_l2_this     = prob_l2_joint[:, l2_global_idx]   # (B,)
+            l3_logits     = out[f"logits_l3_{l2_name}"]       # (B, |children|)
+            l3_local      = F.softmax(l3_logits, dim=-1)      # (B, |children|)
+            for local_idx, l3_name in enumerate(l3_children):
+                global_idx = L3_TO_IDX[l3_name]
+                prob_l3_joint[:, global_idx] = l3_local[:, local_idx] * p_l2_this
 
         pred_l3 = torch.full((B,), -1, dtype=torch.long, device=device)
         for b in range(B):
             l2_idx = pred_l2[b].item()
             if l2_idx < 0:
                 continue
-            # Cari nama L2
-            l2_name = next((n for n, i in L2_TO_IDX.items() if i == l2_idx), None)
+            # cari nama l2 dari global idx
+            l2_name = None
+            for name, idx in L2_TO_IDX.items():
+                if idx == l2_idx:
+                    l2_name = name
+                    break
             if l2_name and l2_name in L3_SIBLINGS:
                 l3_logits = out[f"logits_l3_{l2_name}"][b]
                 l3_local  = l3_logits.argmax().item()
-                if l3_local == 0:
-                    pred_l3[b] = -1   # __none__
-                else:
-                    l3_name    = L3_SIBLINGS[l2_name][l3_local]
-                    pred_l3[b] = L3_TO_IDX[l3_name]
+                l3_name   = L3_SIBLINGS[l2_name][l3_local]
+                pred_l3[b] = L3_TO_IDX[l3_name]
 
         return {
             "pred_l1"      : pred_l1,
@@ -334,6 +385,14 @@ class HSCN(nn.Module):
         }
 
     def get_trainable_params(self, backbone_lr_scale: float = 0.1):
+        """
+        Kembalikan parameter groups untuk optimizer dengan learning rate
+        yang lebih kecil untuk backbone (fine-tuning) dan lr penuh untuk
+        classifier heads.
+
+        Args:
+            backbone_lr_scale: faktor pengali lr untuk backbone
+        """
         backbone_params = list(self.backbone.parameters())
         head_params = (
             list(self.clf_l1.parameters()) +
@@ -347,6 +406,7 @@ class HSCN(nn.Module):
         ]
 
     def count_parameters(self) -> Dict[str, int]:
+        """Hitung jumlah parameter per komponen."""
         def count(module):
             return sum(p.numel() for p in module.parameters())
 
@@ -358,8 +418,10 @@ class HSCN(nn.Module):
             result[f"clf_l2_{k}"] = count(v)
         for k, v in self.clf_l3.items():
             result[f"clf_l3_{k}"] = count(v)
-        result["total"]     = count(self)
-        result["trainable"] = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        result["total"] = count(self)
+        result["trainable"] = sum(
+            p.numel() for p in self.parameters() if p.requires_grad
+        )
         return result
 
 
@@ -379,13 +441,6 @@ if __name__ == "__main__":
     print("\n=== Predictions ===")
     for k, v in pred.items():
         print(f"  {k}: {v}")
-    print("(pred_l3 == -1 berarti model memilih berhenti di L2 / __none__)")
-
-    # Verifikasi jumlah kelas L3
-    print("\n=== L3 Classifier Output Sizes ===")
-    from hierarchy import L3_SIBLINGS, L3_NONE_LABEL
-    for l2, children in L3_SIBLINGS.items():
-        print(f"  clf_l3[{l2}]: {len(children)} kelas {children}")
 
     params = model.count_parameters()
     print("\n=== Parameter Count ===")
